@@ -1,28 +1,38 @@
 """
-rag_core.py — SentinelBrain: ChromaDB-backed persistent memory for Lumina-LY.
+rag_core.py — LuminaContextEngine: ChromaDB-backed persistent context engine for Lumina-LY.
 
 Provides:
-  - memorize()   — incremental hash-fingerprint chunk-and-store into vector DB
-  - recall()     — query the closest memory, with gibberish guard
-  - audit()      — style/anomaly detection against historical corpus
-  - count_memories() — how many vectors are sleeping in cold storage
+  - memorize()              — incremental hash-fingerprint chunk-and-store into vector DB
+  - recall()                — query the closest memory, with data integrity guard
+  - audit()                 — style consistency audit against historical corpus
+  - generate_explanation()  — use DeepSeek to generate natural-language explanation
+  - count_memories()        — how many vectors are stored
 """
 
 import hashlib
 import time
+import os
 from typing import Any
 
 import chromadb
 from chromadb import PersistentClient, Collection
+from openai import OpenAI
+from dotenv import load_dotenv
 
 # ── Safety Tolerances ────────────────────────────────────────────────
-_MAX_FILE_BYTES: int = 5 * 1024 * 1024          # 5 MB — veto oversized
+_MAX_FILE_BYTES: int = 5 * 1024 * 1024          # 5 MB — reject oversized
 _MAX_CHUNKS_PER_FILE: int = 1000                  # cap chunk explosion
-_GIBBERISH_DISTANCE: float = 1.5                  # ≥ this → no relevant memory
+_INTEGRITY_THRESHOLD: float = 1.8                 # 阈值放宽至 1.8：兼容中英跨语言的自然语言查询 (如中文 Query 检索英文 Code)
 _CHUNK_LINES: int = 50                             # lines per chunk
 
 # ── ChromaDB Path ────────────────────────────────────────────────────
 _MEMORY_DB_PATH: str = "./.sentinel_memory"
+
+# ── LLM Config ───────────────────────────────────────────────────────
+load_dotenv()
+_DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+_DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+_DEEPSEEK_MODEL: str = "deepseek-chat"
 
 
 # ── Fingerprint Helper ───────────────────────────────────────────────
@@ -30,18 +40,18 @@ _MEMORY_DB_PATH: str = "./.sentinel_memory"
 def _chunk_hash(text: str) -> str:
     """Return the MD5 hexdigest of *text*.
 
-    Used by :meth:`SentinelBrain.memorize`  to detect whether a chunk
-    has changed since the last index cycle.  MD5 is deliberately **not**
+    Used by :meth:`LuminaContextEngine.memorize` to detect whether a chunk
+    has changed since the last index cycle. MD5 is deliberately **not**
     used for crypto here — only for fast identity dedup.
     """
     return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
-class SentinelBrain:
-    """Persistent vector brain for Lumina-LY.
+class LuminaContextEngine:
+    """Persistent context engine for Lumina-LY.
 
     Wraps a ChromaDB ``PersistentClient`` + a single ``Collection``
-    (``code_style``).  All memories are stored as chunked documents with
+    (``code_style``). All context is stored as chunked documents with
     metadata carrying the source filename, the zero-indexed chunk part,
     and an **MD5 hash fingerprint** for incremental diff.
 
@@ -67,11 +77,11 @@ class SentinelBrain:
         """Incrementally index *content* using MD5 hash fingerprints.
 
         Only chunks whose content has **actually changed** are re-embedded
-        and upserted.  Deleted chunks are purged.  Everything else is
+        and upserted. Deleted chunks are purged. Everything else is
         skipped — zero-cost.
 
-        Safety guards (retained from v1)
-        ---------------------------------
+        Safety guards
+        -------------
         - Files larger than ``_MAX_FILE_BYTES`` (5 MB) are rejected.
         - At most ``_MAX_CHUNKS_PER_FILE`` (1000) chunks are produced;
           remaining lines are truncated.
@@ -85,10 +95,10 @@ class SentinelBrain:
         """
         t0: float = time.perf_counter()
 
-        # ── Size check (v1 carry-over) ───────────────────────────────
+        # ── Size check ───────────────────────────────────────────────
         raw_size: int = len(content.encode("utf-8"))
         if raw_size > _MAX_FILE_BYTES:
-            print(f"[SentinelBrain] ⚠️  '{filename}' 体积 "
+            print(f"[LuminaContextEngine] ⚠️ '{filename}' 体积 "
                   f"{raw_size / 1024 / 1024:.1f} MB "
                   f"超出上限 {_MAX_FILE_BYTES / 1024 / 1024:.0f} MB，"
                   f"已跳过索引。")
@@ -109,7 +119,7 @@ class SentinelBrain:
 
         for i in range(0, len(lines), chunk_size):
             if chunk_count >= max_chunks:
-                print(f"[SentinelBrain] ⚠️  '{filename}' 超过 "
+                print(f"[LuminaContextEngine] ⚠️ '{filename}' 超过 "
                       f"{_MAX_CHUNKS_PER_FILE} 个分块上限，"
                       f"剩余 {len(lines) - i} 行截断未索引。")
                 break
@@ -134,7 +144,6 @@ class SentinelBrain:
             existing = self.collection.get(where={"source": filename})
             if existing and existing["ids"]:
                 for eid, emeta in zip(existing["ids"], existing["metadatas"]):
-                    # Pre-upgrade chunks won't have a "hash" key → treat as ""
                     old_hash_map[eid] = emeta.get("hash", "")
         except Exception:
             pass  # no prior state → all chunks are "new"
@@ -171,7 +180,7 @@ class SentinelBrain:
 
         elapsed: float = time.perf_counter() - t0
 
-        # ── Battle report ────────────────────────────────────────────
+        # ── Index report ─────────────────────────────────────────────
         print(
             f"🚀 [增量引擎] {filename} 扫描完毕："
             f"跳过 {skip_count} 块，更新 {len(upsert_ids)} 块，"
@@ -181,12 +190,12 @@ class SentinelBrain:
     # ── Query ────────────────────────────────────────────────────────
 
     def recall(self, question: str, n_results: int = 1) -> dict[str, list]:
-        """Query the vector DB for the *n_results* closest memories.
+        """Query the vector DB for the *n_results* closest context entries.
 
-        Gibberish / out-of-domain guard (v1 carry-over)
-        -------------------------------------------------
-        If the highest-ranked match has a distance ≥ ``_GIBBERISH_DISTANCE``
-        (1.5 by default), the result is considered noise and an empty
+        Data integrity filter
+        ---------------------
+        If the highest-ranked match has a distance ≥ ``_INTEGRITY_THRESHOLD``
+        (1.8 by default), the result is considered noise and an empty
         record is returned instead.
 
         Parameters
@@ -200,7 +209,7 @@ class SentinelBrain:
         -------
         dict[str, list]
             ChromaDB query result shape — keys ``documents``, ``metadatas``,
-            ``distances``, ``ids``.  When the guard triggers, all lists
+            ``distances``, ``ids``. When the filter triggers, all lists
             are empty.
         """
         results: dict[str, list] = self.collection.query(
@@ -208,23 +217,23 @@ class SentinelBrain:
             n_results=n_results,
         )
 
-        # ── Gibberish firewall ─────────────────────────────────
+        # ── Data integrity filter ──────────────────────────────
         distances = results.get("distances", [])
         if distances and distances[0]:
             best_distance: float = distances[0][0]
-            if best_distance >= _GIBBERISH_DISTANCE:
-                print(f"[SentinelBrain] 🚫 查询与记忆距离 "
+            if best_distance >= _INTEGRITY_THRESHOLD:
+                print(f"[LuminaContextEngine] 🚫 查询与上下文距离 "
                       f"{best_distance:.2f} ≥ 阈值 "
-                      f"{_GIBBERISH_DISTANCE}，判定为无相关记忆。")
+                      f"{_INTEGRITY_THRESHOLD}，判定为无相关上下文。")
                 return {"documents": [], "metadatas": [],
                         "distances": [], "ids": []}
 
         return results
 
-    # ── Audit / Anomaly───────────────────────────────────────────────
+    # ── Audit / Style Consistency ────────────────────────────────────
 
     def audit(self, new_code: str) -> tuple[bool, float]:
-        """Compare *new_code* against the historical corpus to detect style drift.
+        """Compare *new_code* against the historical corpus for style consistency.
 
         Parameters
         ----------
@@ -234,11 +243,11 @@ class SentinelBrain:
         Returns
         -------
         tuple[bool, float]
-            ``(is_safe, distance)`` where *is_safe* is ``True`` when the
+            ``(is_consistent, distance)`` where *is_consistent* is ``True`` when the
             closest match has a distance < 1.2 (stylistically familiar).
         """
         if self.count_memories() == 0:
-            return True, 0.0  # empty brain → safe by default
+            return True, 0.0  # empty engine → safe by default
 
         results = self.collection.query(
             query_texts=[new_code[:500]],
@@ -248,10 +257,79 @@ class SentinelBrain:
         distances = results.get("distances")
         if distances and distances[0]:
             distance: float = distances[0][0]
-            is_safe: bool = distance < 1.2
-            return is_safe, distance
+            is_consistent: bool = distance < 1.2
+            return is_consistent, distance
 
         return True, 0.0
+
+    # ── Generation ───────────────────────────────────────────────────
+
+    def generate_explanation(self, query: str, context_chunks: list[str]) -> str:
+        """Use DeepSeek to generate a natural-language explanation of the code context.
+
+        Parameters
+        ----------
+        query : str
+            The original user query.
+        context_chunks : list[str]
+            Code snippet chunks retrieved from the vector DB.
+
+        Returns
+        -------
+        str
+            Natural-language explanation of the relevant code logic.
+        """
+        if not _DEEPSEEK_API_KEY:
+            return "⚠️ DeepSeek API 密钥未配置，请在 .env 文件中设置 DEEPSEEK_API_KEY。"
+
+        if not context_chunks:
+            return "🤖 未找到相关的代码上下文，无法生成解释。"
+
+        system_prompt = (
+            "你是一名资深架构师。请根据以下提供的代码切片，用通俗、简明的中文"
+            "向用户解释这段代码的业务逻辑和设计意图。\n"
+            "要求：\n"
+            "1. 不要复读原始代码，而是解释其作用和原因。\n"
+            "2. 保持专业但易懂，避免过多技术术语。\n"
+            "3. 如果代码涉及特定的模式或架构决策，请指出。\n"
+            "4. 必须严格使用中华人民共和国国家标准《标点符号用法》"
+            "（GB/T 15834-2011）中规定的学术出版标点符号规范，"
+            "禁止使用不规范的符号或风格。\n"
+        )
+
+        context_text = "\n\n---\n\n".join(context_chunks)
+        user_prompt = (
+            f"用户问题：{query}\n\n"
+            f"相关代码上下文：\n```\n{context_text}\n```"
+        )
+
+        try:
+            client = OpenAI(
+                api_key=_DEEPSEEK_API_KEY,
+                base_url=_DEEPSEEK_BASE_URL,
+            )
+
+            response = client.chat.completions.create(
+                model=_DEEPSEEK_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1024,
+            )
+
+            explanation = response.choices[0].message.content.strip()
+            return explanation
+
+        except Exception as e:
+            error_msg = str(e)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                return "⚠️ DeepSeek API 鉴权失败，请检查 API Key 是否有效。"
+            elif "429" in error_msg or "Rate limit" in error_msg:
+                return "⚠️ API 请求过于频繁，请稍后再试。"
+            else:
+                return f"⚠️ 生成解释时发生错误：{error_msg}"
 
     # ── Utility ──────────────────────────────────────────────────────
 
