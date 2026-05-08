@@ -1,10 +1,10 @@
 """
-lumina_ui.py — Lumina-LY Sentinel desktop overlay.
+lumina_ui.py — Lumina-LY floating desktop overlay.
 
 Floating translucent PyQt6 widget that:
   - watches the project directory for file changes
   - displays project file stats with one-click introspection
-  - provides a query interface to the SentinelBrain vector memory
+  - provides a query interface to the LuminaContextEngine vector memory
   - collapses into a minimalist title bar on double-click
 """
 
@@ -14,9 +14,9 @@ import ast
 import datetime
 from typing import Optional
 
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
-                             QScrollArea, QFrame, QGraphicsOpacityEffect,
-                             QPushButton, QInputDialog)
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout,
+                             QLabel, QScrollArea, QTextBrowser, QFrame,
+                             QGraphicsOpacityEffect, QPushButton, QInputDialog)
 from PyQt6.QtCore import Qt, QPoint, QPropertyAnimation, QEasingCurve, \
     QFileSystemWatcher, QTimer
 from PyQt6.QtGui import QFont, QMouseEvent, QResizeEvent
@@ -27,9 +27,9 @@ except ImportError:
     file_manager = None  # type: ignore[assignment]
 
 try:
-    from rag_core import SentinelBrain
+    from rag_core import LuminaContextEngine
 except ImportError:
-    SentinelBrain = None  # type: ignore[assignment]
+    LuminaContextEngine = None  # type: ignore[assignment]
 
 
 class LuminaSentinel(QWidget):
@@ -51,14 +51,16 @@ class LuminaSentinel(QWidget):
     """
 
     def __init__(self) -> None:
-        """Initialise window flags, brain, watchers, and UI."""
+        """Initialise window flags, engine, watchers, and UI."""
         super().__init__()
 
         # macOS native window → real NSWindow with native title bar
         # and traffic-light buttons.  Full Spaces support out of the box.
+        # NOTE: WindowStaysOnTopHint temporarily disabled for button-integrity
+        #       debugging (Phase 2). Re-enable after confirming the fix.
         self.setWindowFlags(
-            Qt.WindowType.Window |
-            Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.Window
+            # | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Lumina-LY Sentinel")
@@ -70,11 +72,11 @@ class LuminaSentinel(QWidget):
         self.old_pos: Optional[QPoint] = None
         self.is_mini: bool = False
 
-        # ── Brain ────────────────────────────────────────────────
-        if SentinelBrain is not None:
-            self.brain: Optional[SentinelBrain] = SentinelBrain()
+        # ── Engine ───────────────────────────────────────────────
+        if LuminaContextEngine is not None:
+            self.engine: Optional[LuminaContextEngine] = LuminaContextEngine()
         else:
-            self.brain = None
+            self.engine = None
 
         # ── File watcher ─────────────────────────────────────────
         self.watcher: QFileSystemWatcher = QFileSystemWatcher(self)
@@ -144,8 +146,10 @@ class LuminaSentinel(QWidget):
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.container_layout.addWidget(self.title_label)
 
+
+
         # ── Search button (disguised as input field) ────────────
-        self.search_btn: QPushButton = QPushButton(" 🔍 点击唤醒: 哨兵指令舱...")
+        self.search_btn: QPushButton = QPushButton(" 🔍 点击唤醒: 代码分析舱...")
         self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.search_btn.setStyleSheet("""
             QPushButton {
@@ -161,15 +165,21 @@ class LuminaSentinel(QWidget):
         self.search_btn.clicked.connect(self.open_command_center)
         self.container_layout.addWidget(self.search_btn)
 
-        # ── Chat result label ───────────────────────────────────
-        self.chat_result: QLabel = QLabel("")
-        self.chat_result.setWordWrap(True)
-        self.chat_result.setStyleSheet(
-            "color: #E65100; font-weight: bold; "
-            "background: rgba(255,200,150,80); border-radius: 5px; padding: 5px;"
+        # ── Chat result browser (Markdown-rendered, selectable) ──
+        self.chat_browser: QTextBrowser = QTextBrowser()
+        self.chat_browser.setReadOnly(True)
+        self.chat_browser.setOpenExternalLinks(False)
+        self.chat_browser.setMaximumHeight(220)
+        self.chat_browser.setStyleSheet(
+            "QTextBrowser {"
+            "  background: #E6E6FA;"
+            "  color: #2F4F4F;"
+            "  border: none;"
+            "  padding: 8px;"
+            "}"
         )
-        self.chat_result.hide()
-        self.container_layout.addWidget(self.chat_result)
+        self.chat_browser.hide()
+        self.container_layout.addWidget(self.chat_browser)
 
         # ── Separator ───────────────────────────────────────────
         self.line: QFrame = QFrame()
@@ -191,7 +201,7 @@ class LuminaSentinel(QWidget):
         self.container_layout.addWidget(self.scroll_area)
 
         # ── Status bar ──────────────────────────────────────────
-        self.log_label: QLabel = QLabel("哨兵待命...")
+        self.log_label: QLabel = QLabel("引擎待命...")
         self.log_label.setFont(QFont("Courier New", 10))
         self.log_label.setStyleSheet("color: #9575CD; background: transparent; padding-top: 5px;")
         self.log_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -212,7 +222,7 @@ class LuminaSentinel(QWidget):
         ------
         ``"rag"``     — purple &#8596; gold (idle)
         ``"update"``  — purple &#8596; green (safe file change)
-        ``"warning"`` — purple &#8596; red (style anomaly)
+        ``"audit"``   — purple &#8596; red (style consistency drift)
         """
         if state == "rag":
             self.glow_bar.setStyleSheet(
@@ -230,7 +240,7 @@ class LuminaSentinel(QWidget):
                 "stop:1 rgba(81, 45, 168, 220)); "
                 "border-top-left-radius: 18px; border-top-right-radius: 18px;"
             )
-        elif state == "warning":
+        elif state == "audit":
             self.glow_bar.setStyleSheet(
                 "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
                 "stop:0 rgba(81, 45, 168, 220), "
@@ -242,19 +252,21 @@ class LuminaSentinel(QWidget):
     # ── Command Center ────────────────────────────────────────────────
 
     def open_command_center(self) -> None:
-        """Open a ``QInputDialog`` so the user can query the brain.
+        """Open a ``QInputDialog`` so the user can query the engine.
 
         The dialog is used instead of an inline ``QLineEdit`` because the
         native dialog reliably grabs keyboard focus on all desktops /
         window managers.
 
-        On success, the brain's ``recall()`` result is shown in the
-        ``chat_result`` label, which auto-hides after 6 seconds.
+        On success:
+        1. The engine's ``recall()`` retrieves relevant code chunks.
+        2. ``generate_explanation()`` produces a natural-language explanation.
+        3. The explanation is rendered in ``chat_browser`` via Markdown (never auto-hides;
+           user must click the red close button to dismiss).
         """
-        if not self.brain:
-            self.chat_result.setText("⚠️ 大脑未连接！")
-            self.chat_result.show()
-            QTimer.singleShot(3000, self.chat_result.hide)
+        if not self.engine:
+            self.chat_browser.setMarkdown("⚠️ **上下文引擎未连接！**")
+            self.chat_browser.show()
             return
 
         text, ok = QInputDialog.getText(
@@ -263,21 +275,25 @@ class LuminaSentinel(QWidget):
         )
 
         if ok and text:
-            self.chat_result.setText("🔍 正在大脑中检索记忆...")
-            self.chat_result.show()
+            self.chat_browser.setMarkdown("🔍 *正在检索代码上下文...*")
+            self.chat_browser.show()
             QApplication.processEvents()
 
-            answer = self.brain.recall(text)
-            if answer["documents"] and answer["documents"][0]:
-                file_name = answer["metadatas"][0][0]["source"]
-                part = answer["metadatas"][0][0].get("part", "全局(旧记忆)")
-                self.chat_result.setText(
-                    f"🤖 答案线索：\n在 【{file_name}】 的第 {part} 块。"
-                )
-            else:
-                self.chat_result.setText("🤖 记忆中没有找到相关线索...")
+            # Step 1: Retrieve relevant code chunks from vector DB
+            answer = self.engine.recall(text, n_results=3)
 
-            QTimer.singleShot(6000, self.chat_result.hide)
+            if answer["documents"] and answer["documents"][0]:
+                context_chunks = answer["documents"][0]
+
+                # Step 2: Generate natural-language explanation via DeepSeek
+                self.chat_browser.setMarkdown("🤖 *正在生成代码解释...*")
+                QApplication.processEvents()
+
+                explanation = self.engine.generate_explanation(text, context_chunks)
+                self.chat_browser.setMarkdown(f"🤖 {explanation}")
+            else:
+                self.chat_browser.setMarkdown("🤖 代码库中没有与您问题相关的上下文。")
+            # Text stays visible until user clicks the red ● close button
 
     # ── File Change Handler ───────────────────────────────────────────
 
@@ -285,30 +301,30 @@ class LuminaSentinel(QWidget):
         """React to a watched file or directory change.
 
         Skips JetBrains backup artifacts (``___jb_``) and hidden files.
-        When the file exists the content is audited for style drift,
-        then memorised into the vector DB.  The file list is refreshed
+        When the file exists the content is audited for style consistency,
+        then memorised into the vector DB. The file list is refreshed
         after a 500 ms debounce.
         """
         filename = os.path.basename(path)
         if "___jb_" not in filename and not filename.startswith("."):
-            if self.brain and os.path.exists(path):
+            if self.engine and os.path.exists(path):
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         content = f.read()
-                    is_safe, dist = self.brain.audit(content)
-                    if is_safe:
+                    is_consistent, dist = self.engine.audit(content)
+                    if is_consistent:
                         self.set_glow_color("update")
-                        self.log_label.setText(f"✅ 风格安全 (得分:{dist:.2f})")
+                        self.log_label.setText(f"✅ 风格一致性检查通过 (得分:{dist:.2f})")
                     else:
-                        self.set_glow_color("warning")
+                        self.set_glow_color("audit")
                         self.log_label.setStyleSheet("color: red;")
-                        self.log_label.setText(f"🚨 异体入侵！(得分:{dist:.2f})")
+                        self.log_label.setText(f"🚨 风格一致性偏差！(得分:{dist:.2f})")
                         QTimer.singleShot(
                             4000,
                             lambda: self.log_label.setStyleSheet("color: #9575CD;")
                         )
 
-                    self.brain.memorize(filename, content)
+                    self.engine.memorize(filename, content)
                 except Exception:
                     pass
         self.refresh_timer.start(500)
@@ -316,7 +332,7 @@ class LuminaSentinel(QWidget):
     def execute_refresh(self) -> None:
         """Debounced file-list rebuild.
 
-        Called 500 ms after the last file-system event.  Resets the glow
+        Called 500 ms after the last file-system event. Resets the glow
         bar to the idle ``"rag"`` state after a further 1.5 s.
         """
         self.refresh_files()
@@ -460,12 +476,12 @@ class LuminaSentinel(QWidget):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         """End dragging — reset the stored position."""
         self.old_pos = None
-
+    
 
 # ── Entry Point ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    sentinel = LuminaSentinel()
-    sentinel.show()
+    window = LuminaSentinel()
+    window.show()
     sys.exit(app.exec())
